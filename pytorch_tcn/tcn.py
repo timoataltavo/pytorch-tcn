@@ -193,14 +193,23 @@ class CausalConv1d(nn.Conv1d):
             self,
             x,
             inference=False,
+            buffer=None,
             ):
+        out_buffer = None
+
         if inference:
-            x = self.inference(x)
+            if buffer is not None:
+                x, out_buffer = self.inference(x, buffer)
+            else:
+                x, self.buffer = self.inference(x, self.buffer)
+                out_buffer = self.buffer
+            
         else:
             x = self._forward(x)
-        return x
+        
+        return x, out_buffer
     
-    def inference(self, x):
+    def inference(self, x, buffer):
         if x.shape[0] != 1:
             raise ValueError(
                 f"""
@@ -221,11 +230,11 @@ class CausalConv1d(nn.Conv1d):
             -1,
             )
         if self.lookahead > 0:
-            self.buffer = x[:, :, -(self.pad_len+self.lookahead) : -self.lookahead ]
+            buffer = x[:, :, -(self.pad_len+self.lookahead) : -self.lookahead ]
         else:
-            self.buffer = x[:, :, -self.buffer_len: ]
+            buffer = x[:, :, -self.buffer_len: ]
         x = super().forward(x)
-        return x
+        return x, buffer
     
     def reset_buffer(self):
         self.buffer.zero_()
@@ -237,7 +246,6 @@ class CausalConv1d(nn.Conv1d):
                 """
                 )
         return
-
 
 
 class TemporalConv1d(nn.Conv1d):
@@ -279,7 +287,7 @@ class TemporalConv1d(nn.Conv1d):
 
         x = super(TemporalConv1d, self).forward(x)
 
-        return x
+        return x, None
 
 
 
@@ -493,8 +501,17 @@ class TemporalBlock(nn.Module):
             x,
             embeddings,
             inference,
+            buffers=None
             ):
-        out = self.conv1(x, inference=inference)
+        
+        conv1_buffer = None
+        conv2_buffer = None
+
+        if buffers is not None:
+            conv1_buffer, conv2_buffer = buffers
+
+
+        out, out_buffer_1 = self.conv1(x, inference=inference, buffer=conv1_buffer)
         out = self.apply_norm( self.norm1, out )
 
         if embeddings is not None:
@@ -503,18 +520,19 @@ class TemporalBlock(nn.Module):
         out = self.activation1(out)
         out = self.dropout1(out)
 
-        out = self.conv2(out, inference=inference)
+        out, out_buffer_2 = self.conv2(out, inference=inference, buffer=conv2_buffer)
         out = self.apply_norm( self.norm2, out )
         out = self.activation2(out)
         out = self.dropout2(out)
 
         res = x if self.downsample is None else self.downsample(x)
-        return self.activation_final(out + res), out
+        return self.activation_final(out + res), out, [out_buffer_1, out_buffer_2]
     
     def inference(
             self,
             x,
             embeddings,
+            buffers
             ):
         if not self.causal:
             raise ValueError(
@@ -524,9 +542,12 @@ class TemporalBlock(nn.Module):
                 However, you selected a non-causal network.
                 """
                 )
-        x, out = self.forward(x, embeddings, inference=True)
-        return x, out
-
+        x, out, out_buffers = self.forward(x, embeddings, inference=True, buffers=buffers)
+        return x, out, out_buffers
+    
+    def list_buffers(self):
+        if self.causal:
+            return [ self.conv1.buffer, self.conv2.buffer ]
 
 
 class TCN(nn.Module):
@@ -690,6 +711,7 @@ class TCN(nn.Module):
 
         if self.causal:
             self.reset_buffers()
+            self.buffers = []
         return
     
     def init_skip_connection_weights(self):
@@ -705,12 +727,15 @@ class TCN(nn.Module):
                     )
         return
 
-    def forward(
+    def _forward(
             self,
             x,
             embeddings=None,
             inference=False,
+            buffers=None
             ):
+        
+        out_buffers = []
         if inference and not self.causal:
             raise ValueError(
                 """
@@ -726,26 +751,40 @@ class TCN(nn.Module):
             # Adding skip connections from each layer to the output
             # Excluding the last layer, as it would not skip trainable weights
             for index, layer in enumerate( self.network ):
-                x, skip_out = layer(
+                layer_buffers = None
+                if buffers:
+                    layer_buffers = buffers[index]
+
+                x, skip_out, layer_out_buffers = layer(
                     x,
                     embeddings=embeddings,
                     inference=inference,
+                    buffers=layer_buffers
                     )
                 if self.downsample_skip_connection[ index ] is not None:
                     skip_out = self.downsample_skip_connection[ index ]( skip_out )
                 if index < len( self.network ) - 1:
                     skip_connections.append( skip_out )
+
+                out_buffers.append( layer_out_buffers )
             skip_connections.append( x )
             x = torch.stack( skip_connections, dim=0 ).sum( dim=0 )
             x = self.activation_skip_out( x )
         else:
-            for layer in self.network:
+            for index, layer in enumerate(self.network):
                 #print( 'TCN, embeddings:', embeddings.shape )
-                x, _ = layer(
+                layer_buffers = None
+                if buffers:
+                    layer_buffers = buffers[index]
+                
+                x, _, layer_out_buffers = layer(
                     x,
                     embeddings=embeddings,
                     inference=inference,
+                    buffers=layer_buffers
                     )
+                
+                out_buffers.append( layer_out_buffers )
         if self.projection_out is not None:
             x = self.projection_out( x )
         if self.activation_out is not None:
@@ -754,19 +793,37 @@ class TCN(nn.Module):
             x = x[ :, :, self.lookahead: ]
         if self.input_shape == 'NLC':
             x = x.transpose(1, 2)
-        return x
+        return x, out_buffers
     
-    def inference(
+    def forward(
             self,
             x,
             embeddings=None,
+            inference=False,
+            buffers=None
             ):
-        x = self.forward(
+        x, _ = self._forward(
+            x,
+            embeddings=embeddings,
+            inference=inference,
+            buffers=buffers,
+            )
+        return x
+    
+
+    def inference(
+            self,
+            x,
+            buffers=None,
+            embeddings=None
+            ):
+        x, out_buffers = self._forward(
             x,
             embeddings=embeddings,
             inference=True,
+            buffers=buffers,
             )
-        return x
+        return x, out_buffers
     
     def reset_buffers(self):
         def _reset_buffer(x):
@@ -774,3 +831,6 @@ class TCN(nn.Module):
                 x.reset_buffer()
         self.apply(_reset_buffer)
         return
+
+    def buffer_list(self):
+        return [l.list_buffers() for l in self.network]
